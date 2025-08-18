@@ -269,13 +269,15 @@ client_id = st.text_input("Client ID", type="default")
 client_secret = st.text_input("Client Secret", type="password")
 uploaded_csv = st.file_uploader("Upload CSV (invoice lines)", type=["csv"])
 
-with st.expander("Optional header overrides (used if missing in CSV)"):
-    override_external_client_id = st.text_input("externalClientId (fallback)", value="")
-    override_external_company_id = st.text_input("externalCompanyId (fallback)", value="")
-    override_external_supplier_id = st.text_input("externalSupplierId (fallback)", value="")
-    override_currency = st.text_input("currency (fallback, e.g. EUR)", value="")
-    override_document_id = st.text_input("documentId (fallback)", value="")
-    override_external_id = st.text_input("externalId (fallback if not in CSV)", value="")
+with st.expander("Optional header overrides (used if missing in CSV, or in Test Mode)"):
+    override_external_client_id = st.text_input("externalClientId (fallback/test)", value="CLIENT-TEST")
+    override_external_company_id = st.text_input("externalCompanyId (fallback/test)", value="COMPANY-TEST")
+    override_external_supplier_id = st.text_input("externalSupplierId (fallback/test)", value="SUPPLIER-TEST")
+    override_currency = st.text_input("currency (ISO 4217, e.g. EUR)", value="EUR")
+    override_document_id = st.text_input("documentId", value="DOC-TEST-001")
+    override_external_id = st.text_input("externalId (invoice id)", value="TEST-INVOICE-001")
+
+test_mode = st.checkbox("Test without CSV (use only overrides & dummy line)", value=False)
 
 dry_run = st.toggle("Dry run (do not POST, just preview JSON)", value=True)
 pretty = st.toggle("Pretty-print JSON", value=True)
@@ -307,8 +309,29 @@ with col1:
 
 with col2:
     if st.button("🚀 Transform & Send"):
-        if not uploaded_csv:
-            st.error("Please upload a CSV first.")
+        if not uploaded_csv and not test_mode:
+            st.error("Please upload a CSV or enable 'Test without CSV'.")
+            st.stop()
+
+        if test_mode:
+            # build dummy rows list using overrides
+            dummy_row = {
+                "externalId": override_external_id or "TEST-INVOICE-001",
+                "externalClientId": override_external_client_id,
+                "externalCompanyId": override_external_company_id,
+                "externalSupplierId": override_external_supplier_id,
+                "currency": override_currency or "EUR",
+                "documentId": override_document_id,
+                "issuedDate": datetime.utcnow().strftime("%Y-%m-%d"),
+                "netAmount": "100.00",
+                "totalTaxAmount": "19.00",
+                "grossAmount": "119.00",
+                "quantity": "1",
+                "unitPrice": "100.00",
+                "line.externalId": "LINE-1",
+                "itemText": "Dummy service for testing",
+            }
+            groups = {dummy_row["externalId"]: [dummy_row]}
         else:
             try:
                 groups = read_csv_grouped_by_external_id(uploaded_csv)
