@@ -54,31 +54,55 @@ def first_nonempty(*vals):
 # =========================
 # --- OAuth (Client Credentials)
 # =========================
-def get_access_token(base_url: str, client_id: str, client_secret: str):
+def get_access_token(base_url: str, client_id: str, client_secret: str, auth_path: str = "/auth/token"):
     """
-    POST {base_url}/auth/token with application/x-www-form-urlencoded:
-      grant_type=client_credentials
-    Using HTTP Basic auth (client_id, client_secret).
-    Returns (access_token:str, expires_at:datetime) or raises.
+    Robust token fetch:
+      - trims base_url/auth_path
+      - prints the full URL (for Streamlit)
+      - tries Basic auth first, then body creds fallback
     """
-    url = base_url.rstrip("/") + AUTH_PATH
-    data = {"grant_type": "client_credentials"}
-    # Per Hypatos docs, this endpoint uses Basic auth with client id/secret.
-    resp = requests.post(
-        url,
-        data=data,
-        auth=(client_id, client_secret),
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=60,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"Token request failed: {resp.status_code} {resp.text}")
-    payload = resp.json()
-    access_token = payload.get("access_token")
-    expires_in = payload.get("expires_in", 3600)
-    if not access_token:
-        raise RuntimeError(f"No access_token in response: {payload}")
-    return access_token, datetime.utcnow() + timedelta(seconds=int(expires_in))
+    base_url = (base_url or "").strip().rstrip("/")
+    auth_path = (auth_path or "/auth/token").strip()
+    if not auth_path.startswith("/"):
+        auth_path = "/" + auth_path
+
+    url = base_url + auth_path
+
+    # Show the exact URL in the UI for debugging
+    st.info(f"Token URL: `{url}`")
+
+    form = {"grant_type": "client_credentials"}
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+    # --- Try 1: HTTP Basic (recommended by Hypatos docs)
+    try:
+        r = requests.post(url, data=form, headers=headers,
+                          auth=(client_id.strip(), client_secret.strip()),
+                          timeout=60)
+        if r.status_code == 200:
+            data = r.json()
+            return data["access_token"], datetime.utcnow() + timedelta(seconds=int(data.get("expires_in", 3600))), data
+        else:
+            # Show raw body to troubleshoot 404s, etc.
+            st.warning(f"Basic-auth token attempt failed: {r.status_code} {r.text}")
+    except requests.RequestException as e:
+        st.warning(f"Basic-auth token request error: {e}")
+
+    # --- Try 2: Client creds in body (some gateways prefer this)
+    try:
+        form_fallback = {
+            "grant_type": "client_credentials",
+            "client_id": client_id.strip(),
+            "client_secret": client_secret.strip(),
+        }
+        r2 = requests.post(url, data=form_fallback, headers=headers, timeout=60)
+        if r2.status_code == 200:
+            data = r2.json()
+            return data["access_token"], datetime.utcnow() + timedelta(seconds=int(data.get("expires_in", 3600))), data
+        else:
+            raise RuntimeError(f"Fallback token attempt failed: {r2.status_code} {r2.text}")
+    except requests.RequestException as e:
+        raise RuntimeError(f"Fallback token request error: {e}")
 
 def bearer_headers(token: str):
     return {
@@ -305,10 +329,11 @@ col1, col2 = st.columns(2)
 with col1:
     if st.button("🔑 Get Access Token"):
         try:
-            token, exp = get_access_token(base_url, client_id, client_secret)
+            token, exp, raw = get_access_token(base_url, client_id, client_secret, auth_path=auth_path)
             st.session_state.token = token
             st.session_state.token_expiry = exp
-            st.success(f"Token acquired. Expires ~ {int((exp - datetime.utcnow()).total_seconds())}s.")
+            st.success(f"Token acquired. Expires in ~{int((exp - datetime.utcnow()).total_seconds())}s.")
+            st.code(json.dumps(raw, indent=2), language="json")
         except Exception as e:
             st.error(str(e))
 
