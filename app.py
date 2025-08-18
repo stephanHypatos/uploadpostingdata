@@ -309,27 +309,31 @@ with col1:
 
 with col2:
     if st.button("🚀 Transform & Send"):
+        # Require either a CSV or test mode
         if not uploaded_csv and not test_mode:
             st.error("Please upload a CSV or enable 'Test without CSV'.")
             st.stop()
 
+        # Prepare groups (either from CSV or using a single dummy row)
         if test_mode:
-            # build dummy rows list using overrides
+            # Build a minimal, valid dummy line from overrides
             dummy_row = {
-                "externalId": override_external_id or "TEST-INVOICE-001",
-                "externalClientId": override_external_client_id,
-                "externalCompanyId": override_external_company_id,
-                "externalSupplierId": override_external_supplier_id,
-                "currency": override_currency or "EUR",
-                "documentId": override_document_id,
+                "externalId": (override_external_id or "TEST-INVOICE-001").strip() or "TEST-INVOICE-001",
+                "externalClientId": (override_external_client_id or "").strip() or "CLIENT-TEST",
+                "externalCompanyId": (override_external_company_id or "").strip() or "COMPANY-TEST",
+                "externalSupplierId": (override_external_supplier_id or "").strip() or "SUPPLIER-TEST",
+                "currency": (override_currency or "").strip() or "EUR",
+                "documentId": (override_document_id or "").strip() or "DOC-TEST-001",
                 "issuedDate": datetime.utcnow().strftime("%Y-%m-%d"),
+
+                # --- line fields (single dummy line) ---
+                "line.externalId": "LINE-1",
+                "quantity": "1",
+                "unitPrice": "100.00",
                 "netAmount": "100.00",
                 "totalTaxAmount": "19.00",
                 "grossAmount": "119.00",
-                "quantity": "1",
-                "unitPrice": "100.00",
-                "line.externalId": "LINE-1",
-                "itemText": "Dummy service for testing",
+                "itemText": "Dummy service for testing"
             }
             groups = {dummy_row["externalId"]: [dummy_row]}
         else:
@@ -339,6 +343,10 @@ with col2:
                 st.error(f"CSV error: {e}")
                 st.stop()
 
+        # Transform and (optionally) POST
+        results = []
+        for ext_id, rows in groups.items():
+            # Build payload
             overrides = {
                 "external_client_id": override_external_client_id or None,
                 "external_company_id": override_external_company_id or None,
@@ -347,41 +355,41 @@ with col2:
                 "document_id": override_document_id or None,
                 "external_id": override_external_id or None,
             }
+            try:
+                payload = build_invoice_payload_from_rows(rows, overrides)
+            except Exception as e:
+                results.append((ext_id, None, f"Build payload error: {e}", None))
+                continue
 
-            results = []
-            for ext_id, rows in groups.items():
+            body = json.dumps(payload, indent=2) if pretty else json.dumps(payload)
+
+            # Dry-run? Just show the JSON
+            if dry_run:
+                results.append((ext_id, 0, "Dry run: not sent", body))
+                continue
+
+            # POST to enrichment insert
+            try:
+                # Ensure we have a valid token
+                ensure_token()
+                url = base_url.rstrip("/") + endpoint_path
+                resp = requests.post(url, headers=bearer_headers(st.session_state.token), data=body, timeout=60)
                 try:
-                    payload = build_invoice_payload_from_rows(rows, overrides)
-                except Exception as e:
-                    results.append((ext_id, None, f"Build payload error: {e}", None))
-                    continue
+                    resp_body = json.dumps(resp.json(), indent=2)
+                except Exception:
+                    resp_body = resp.text
+                results.append((ext_id, resp.status_code, None, resp_body))
+            except Exception as e:
+                results.append((ext_id, None, f"POST error: {e}", None))
 
-                body = json.dumps(payload, indent=2) if pretty else json.dumps(payload)
-
-                if dry_run:
-                    results.append((ext_id, 0, "Dry run: not sent", body))
-                    continue
-
-                try:
-                    ensure_token()
-                    url = base_url.rstrip("/") + endpoint_path
-                    resp = requests.post(url, headers=bearer_headers(st.session_state.token), data=body, timeout=60)
-                    # show raw response body
-                    try:
-                        resp_body = json.dumps(resp.json(), indent=2)
-                    except Exception:
-                        resp_body = resp.text
-                    results.append((ext_id, resp.status_code, None, resp_body))
-                except Exception as e:
-                    results.append((ext_id, None, f"POST error: {e}", None))
-
-            st.subheader("Results")
-            for ext_id, status, err, body in results:
-                with st.container(border=True):
-                    st.markdown(f"**externalId:** `{ext_id}`")
-                    if status is not None and status != 0:
-                        st.markdown(f"**HTTP Status:** `{status}`")
-                    if err:
-                        st.error(err)
-                    if body:
-                        st.code(body, language="json")
+        # Show results
+        st.subheader("Results")
+        for ext_id, status, err, body in results:
+            with st.container(border=True):
+                st.markdown(f"**externalId:** `{ext_id}`")
+                if status is not None and status != 0:
+                    st.markdown(f"**HTTP Status:** `{status}`")
+                if err:
+                    st.error(err)
+                if body:
+                    st.code(body, language="json")
