@@ -11,7 +11,7 @@ import streamlit as st
 # =========================
 DEFAULT_BASE_URL = "https://api.cloud.hypatos.ai"
 AUTH_PATH = "/v2/auth/token"
-ENRICHMENT_INSERT_PATH = "/enrichment/invoices"
+ENRICHMENT_INSERT_PATH = "/v2/enrichment/invoices"
 
 # =========================
 # --- Utils
