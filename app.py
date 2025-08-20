@@ -51,6 +51,94 @@ def first_nonempty(*vals):
             return v
     return None
 
+def _sample_rows(with_gl_cc: bool = False):
+    """Two invoices: ext-1 (1 line), ext-2 (2 lines). Optionally include GL & Cost Center."""
+    base_common_1 = {
+        "externalId": "ext-1",
+        "documentId": "686caa631bb57c4804f8a681",
+        "supplierInvoiceNumber": "INV-001",
+        "invoiceNumber": "1001",
+        "externalCompanyId": "COMP-001",
+        "externalSupplierId": "SUP-001",
+        "currency": "EUR",
+        "issuedDate": "2025-08-01",
+        "line.externalId": "line-1",
+        "quantity": "2",
+        "unitPrice": "50.00",
+        "netAmount": "100.00",
+        "totalTaxAmount": "19.00",
+        "grossAmount": "119.00",
+        "itemText": "Consulting Service",
+    }
+    base_common_2_1 = {
+        "externalId": "ext-2",
+        "documentId": "686caa631bb57c4804f8a682",
+        "supplierInvoiceNumber": "INV-002",
+        "invoiceNumber": "1002",
+        "externalCompanyId": "COMP-002",
+        "externalSupplierId": "SUP-002",
+        "currency": "USD",
+        "issuedDate": "2025-08-05",
+        "line.externalId": "line-1",
+        "quantity": "5",
+        "unitPrice": "20.00",
+        "netAmount": "100.00",
+        "totalTaxAmount": "10.00",
+        "grossAmount": "110.00",
+        "itemText": "Office Supplies",
+    }
+    base_common_2_2 = {
+        "externalId": "ext-2",
+        "documentId": "686caa631bb57c4804f8a682",
+        "supplierInvoiceNumber": "INV-002",
+        "invoiceNumber": "1002",
+        "externalCompanyId": "COMP-002",
+        "externalSupplierId": "SUP-002",
+        "currency": "USD",
+        "issuedDate": "2025-08-05",
+        "line.externalId": "line-2",
+        "quantity": "1",
+        "unitPrice": "200.00",
+        "netAmount": "200.00",
+        "totalTaxAmount": "20.00",
+        "grossAmount": "220.00",
+        "itemText": "Software License",
+    }
+
+    if with_gl_cc:
+        base_common_1.update({
+            "externalGlAccountId": "GL-7000", "glAccountCode": "7000",
+            "externalCostCenterId": "CC-100", "costCenterCode": "ADMIN-100",
+        })
+        base_common_2_1.update({
+            "externalGlAccountId": "GL-4000", "glAccountCode": "4000",
+            "externalCostCenterId": "CC-200", "costCenterCode": "OPS-200",
+        })
+        base_common_2_2.update({
+            "externalGlAccountId": "GL-6500", "glAccountCode": "6500",
+            "externalCostCenterId": "CC-300", "costCenterCode": "IT-300",
+        })
+
+    return [base_common_1, base_common_2_1, base_common_2_2]
+
+
+def make_sample_csv_bytes(with_gl_cc: bool = False) -> bytes:
+    """Basic sample (2 invoices / 3 lines)."""
+    header = [
+        "externalId","documentId","supplierInvoiceNumber","invoiceNumber",
+        "externalCompanyId","externalSupplierId","currency","issuedDate",
+        "line.externalId","quantity","unitPrice","netAmount","totalTaxAmount",
+        "grossAmount","itemText",
+        "externalGlAccountId","glAccountCode","externalCostCenterId","costCenterCode",
+    ]
+    rows = _sample_rows(with_gl_cc=with_gl_cc)
+    sio = io.StringIO()
+    writer = csv.DictWriter(sio, fieldnames=header, extrasaction="ignore")
+    writer.writeheader()
+    for r in rows:
+        writer.writerow(r)
+    return sio.getvalue().encode("utf-8")
+
 def make_scenarios_csv_bytes() -> bytes:
     """
     Build a CSV that covers:
@@ -432,6 +520,7 @@ client_id = st.text_input("Client ID", type="default")
 client_secret = st.text_input("Client Secret", type="password")
 uploaded_csv = st.file_uploader("Upload CSV (invoice lines)", type=["csv"])
 
+
 with st.expander("📥 Sample CSV downloads", expanded=False):
     # Basic sample (if you already added this earlier)
     basic_bytes = make_sample_csv_bytes(with_gl_cc=False)
@@ -485,7 +574,7 @@ def ensure_token():
         raise RuntimeError("Client ID and Client Secret are required.")
     # refresh if missing/expired (small skew)
     if (not st.session_state.token) or (datetime.utcnow() > st.session_state.token_expiry - timedelta(seconds=30)):
-        token, exp = get_access_token(base_url, client_id, client_secret)
+        token, exp, _ = get_access_token(base_url, client_id, client_secret, auth_path=auth_path)
         st.session_state.token = token
         st.session_state.token_expiry = exp
 
