@@ -1,5 +1,5 @@
 import json
-import csv
+import io, csv
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta
@@ -50,6 +50,169 @@ def first_nonempty(*vals):
         if v is not None and str(v).strip() != "":
             return v
     return None
+
+def make_scenarios_csv_bytes() -> bytes:
+    """
+    Build a CSV that covers:
+      - Scenario 1: FI invoice, 1 line (no PO fields)
+      - Scenario 2: FI invoice, 2 lines (no PO fields, different GL & net)
+      - Scenario 3: PO invoice, 1 line (no FI fields)
+      - Scenario 4: PO invoice, 2 lines (no FI fields, different net amounts)
+    All documentIds are 24-digit numeric.
+    """
+    def doc_id(n: int) -> str:
+        # 24-digit numeric string (YYYYMMDD as prefix to look realistic)
+        return f"20250820{n:016d}"[:24]
+
+    common_header = {
+        "externalCompanyId": "COMP-DE-01",
+        "externalSupplierId": "SUP-DE-01",
+        "currency": "EUR",
+        "issuedDate": "2025-08-10",
+        "receivedDate": "2025-08-11",
+        "postingDate": "2025-08-12",
+        "isCanceled": "false",
+        "isCreditNote": "false",
+        "headerText": "Sample invoice for demo",
+        "paymentTermKey": "NET30",
+        "paymentTermText": "Net 30 days",
+        "paymentTermLanguage": "en",
+        "unitOfMeasure": "EA",
+        "taxCode.code": "DEU_Standard",
+        "taxCode.description": "DEU - Standard (19%)",
+        "taxJurisdictionCode": "DEU",
+    }
+
+    rows = []
+
+    # Scenario 1 — FI 1 line (no PO fields)
+    rows.append({
+        **common_header,
+        "externalId": "ext-fi-1",
+        "documentId": doc_id(1),
+        "supplierInvoiceNumber": "FINV-001",
+        "invoiceNumber": "10001",
+        "line.externalId": "line-1",
+        "quantity": "2",
+        "unitPrice": "50.00",
+        "netAmount": "100.00",
+        "totalTaxAmount": "19.00",
+        "grossAmount": "119.00",
+        "itemText": "Consulting Service",
+        "externalGlAccountId": "GL-7000",
+        "glAccountCode": "7000",
+        "externalCostCenterId": "CC-100",
+        "costCenterCode": "ADMIN-100",
+    })
+
+    # Scenario 2 — FI 2 lines (no PO fields, different GL & net)
+    rows.append({
+        **common_header,
+        "externalId": "ext-fi-2",
+        "documentId": doc_id(2),
+        "supplierInvoiceNumber": "FINV-002",
+        "invoiceNumber": "10002",
+        "line.externalId": "line-1",
+        "quantity": "3",
+        "unitPrice": "40.00",
+        "netAmount": "120.00",
+        "totalTaxAmount": "22.80",
+        "grossAmount": "142.80",
+        "itemText": "Hardware Components",
+        "externalGlAccountId": "GL-4000",
+        "glAccountCode": "4000",
+        "externalCostCenterId": "CC-200",
+        "costCenterCode": "OPS-200",
+    })
+    rows.append({
+        **common_header,
+        "externalId": "ext-fi-2",
+        "documentId": doc_id(2),
+        "supplierInvoiceNumber": "FINV-002",
+        "invoiceNumber": "10002",
+        "line.externalId": "line-2",
+        "quantity": "5",
+        "unitPrice": "40.00",
+        "netAmount": "200.00",
+        "totalTaxAmount": "38.00",
+        "grossAmount": "238.00",
+        "itemText": "Software Subscription",
+        "externalGlAccountId": "GL-6500",
+        "glAccountCode": "6500",
+        "externalCostCenterId": "CC-300",
+        "costCenterCode": "IT-300",
+    })
+
+    # Scenario 3 — PO 1 line (no FI fields)
+    rows.append({
+        **common_header,
+        "externalId": "ext-po-1",
+        "documentId": doc_id(3),
+        "supplierInvoiceNumber": "POINV-001",
+        "invoiceNumber": "20001",
+        "line.externalId": "line-1",
+        "quantity": "3",
+        "unitPrice": "50.00",
+        "netAmount": "150.00",
+        "totalTaxAmount": "28.50",
+        "grossAmount": "178.50",
+        "itemText": "Maintenance Service",
+        "externalPurchaseOrderId": "4500000001",
+        "purchaseOrderLineNumber": "00010",
+    })
+
+    # Scenario 4 — PO 2 lines (no FI fields, different net amounts)
+    rows.append({
+        **common_header,
+        "externalId": "ext-po-2",
+        "documentId": doc_id(4),
+        "supplierInvoiceNumber": "POINV-002",
+        "invoiceNumber": "20002",
+        "line.externalId": "line-1",
+        "quantity": "4",
+        "unitPrice": "20.00",
+        "netAmount": "80.00",
+        "totalTaxAmount": "15.20",
+        "grossAmount": "95.20",
+        "itemText": "Packaging Materials",
+        "externalPurchaseOrderId": "4500000002",
+        "purchaseOrderLineNumber": "00010",
+    })
+    rows.append({
+        **common_header,
+        "externalId": "ext-po-2",
+        "documentId": doc_id(4),
+        "supplierInvoiceNumber": "POINV-002",
+        "invoiceNumber": "20002",
+        "line.externalId": "line-2",
+        "quantity": "10",
+        "unitPrice": "23.00",
+        "netAmount": "230.00",
+        "totalTaxAmount": "43.70",
+        "grossAmount": "273.70",
+        "itemText": "Transport Service",
+        "externalPurchaseOrderId": "4500000002",
+        "purchaseOrderLineNumber": "00020",
+    })
+
+    # Stable header order (includes all possible columns used above)
+    header = [
+        "externalId","documentId","supplierInvoiceNumber","invoiceNumber",
+        "externalCompanyId","externalSupplierId","currency",
+        "issuedDate","receivedDate","postingDate","isCanceled","isCreditNote",
+        "headerText","paymentTermKey","paymentTermText","paymentTermLanguage",
+        "unitOfMeasure","taxCode.code","taxCode.description","taxJurisdictionCode",
+        "line.externalId","quantity","unitPrice","netAmount","totalTaxAmount","grossAmount","itemText",
+        "externalGlAccountId","glAccountCode","externalCostCenterId","costCenterCode",
+        "externalPurchaseOrderId","purchaseOrderLineNumber"
+    ]
+
+    sio = io.StringIO()
+    writer = csv.DictWriter(sio, fieldnames=header, extrasaction="ignore")
+    writer.writeheader()
+    for r in rows:
+        writer.writerow(r)
+    return sio.getvalue().encode("utf-8")
 
 # =========================
 # --- OAuth (Client Credentials)
@@ -269,6 +432,37 @@ client_id = st.text_input("Client ID", type="default")
 client_secret = st.text_input("Client Secret", type="password")
 uploaded_csv = st.file_uploader("Upload CSV (invoice lines)", type=["csv"])
 
+with st.expander("📥 Sample CSV downloads", expanded=False):
+    # Basic sample (if you already added this earlier)
+    basic_bytes = make_sample_csv_bytes(with_gl_cc=False)
+    st.download_button(
+        label="Download sample (basic, 2 invoices / 3 lines)",
+        data=basic_bytes,
+        file_name="sample_invoices.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    # With GL & Cost Center (if added earlier)
+    glcc_bytes = make_sample_csv_bytes(with_gl_cc=True)
+    st.download_button(
+        label="Download sample (with GL & Cost Center)",
+        data=glcc_bytes,
+        file_name="sample_invoices_with_gl_cc.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    # NEW: Scenario-rich demo file (FI / PO combinations)
+    scenarios_bytes = make_scenarios_csv_bytes()
+    st.download_button(
+        label="Download sample (scenario-rich: FI & PO cases)",
+        data=scenarios_bytes,
+        file_name="demo_invoices_scenarios.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    
 with st.expander("Optional header overrides (used if missing in CSV, or in Test Mode)"):
     override_external_client_id = st.text_input("externalClientId (fallback/test)", value="CLIENT-TEST")
     override_external_company_id = st.text_input("externalCompanyId (fallback/test)", value="COMPANY-TEST")
