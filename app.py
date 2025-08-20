@@ -3,6 +3,7 @@ import io, csv
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta
+
 import requests
 import streamlit as st
 
@@ -17,6 +18,7 @@ ENRICHMENT_INSERT_PATH = "/v2/enrichment/invoices"
 # --- Utils
 # =========================
 def d(value):
+    """Safely convert to Decimal or return None."""
     if value is None or str(value).strip() == "":
         return None
     try:
@@ -25,6 +27,7 @@ def d(value):
         return None
 
 def to_num(value):
+    """Convert Decimal/str to float for JSON."""
     if value is None:
         return None
     if isinstance(value, Decimal):
@@ -35,6 +38,7 @@ def to_num(value):
         return None
 
 def clean_date(s):
+    """Normalize to YYYY-MM-DD when possible."""
     if not s or not str(s).strip():
         return None
     s = str(s).strip()
@@ -51,6 +55,9 @@ def first_nonempty(*vals):
             return v
     return None
 
+# =========================
+# --- Sample CSV helpers
+# =========================
 def _sample_rows(with_gl_cc: bool = False):
     """Two invoices: ext-1 (1 line), ext-2 (2 lines). Optionally include GL & Cost Center."""
     base_common_1 = {
@@ -121,7 +128,6 @@ def _sample_rows(with_gl_cc: bool = False):
 
     return [base_common_1, base_common_2_1, base_common_2_2]
 
-
 def make_sample_csv_bytes(with_gl_cc: bool = False) -> bytes:
     """Basic sample (2 invoices / 3 lines)."""
     header = [
@@ -141,7 +147,7 @@ def make_sample_csv_bytes(with_gl_cc: bool = False) -> bytes:
 
 def make_scenarios_csv_bytes() -> bytes:
     """
-    Build a CSV that covers:
+    Scenario CSV:
       - Scenario 1: FI invoice, 1 line (no PO fields)
       - Scenario 2: FI invoice, 2 lines (no PO fields, different GL & net)
       - Scenario 3: PO invoice, 1 line (no FI fields)
@@ -149,7 +155,6 @@ def make_scenarios_csv_bytes() -> bytes:
     All documentIds are 24-digit numeric.
     """
     def doc_id(n: int) -> str:
-        # 24-digit numeric string (YYYYMMDD as prefix to look realistic)
         return f"20250820{n:016d}"[:24]
 
     common_header = {
@@ -173,7 +178,7 @@ def make_scenarios_csv_bytes() -> bytes:
 
     rows = []
 
-    # Scenario 1 — FI 1 line (no PO fields)
+    # Scenario 1 — FI 1 line
     rows.append({
         **common_header,
         "externalId": "ext-fi-1",
@@ -193,7 +198,7 @@ def make_scenarios_csv_bytes() -> bytes:
         "costCenterCode": "ADMIN-100",
     })
 
-    # Scenario 2 — FI 2 lines (no PO fields, different GL & net)
+    # Scenario 2 — FI 2 lines
     rows.append({
         **common_header,
         "externalId": "ext-fi-2",
@@ -231,7 +236,7 @@ def make_scenarios_csv_bytes() -> bytes:
         "costCenterCode": "IT-300",
     })
 
-    # Scenario 3 — PO 1 line (no FI fields)
+    # Scenario 3 — PO 1 line
     rows.append({
         **common_header,
         "externalId": "ext-po-1",
@@ -249,7 +254,7 @@ def make_scenarios_csv_bytes() -> bytes:
         "purchaseOrderLineNumber": "00010",
     })
 
-    # Scenario 4 — PO 2 lines (no FI fields, different net amounts)
+    # Scenario 4 — PO 2 lines
     rows.append({
         **common_header,
         "externalId": "ext-po-2",
@@ -283,7 +288,6 @@ def make_scenarios_csv_bytes() -> bytes:
         "purchaseOrderLineNumber": "00020",
     })
 
-    # Stable header order (includes all possible columns used above)
     header = [
         "externalId","documentId","supplierInvoiceNumber","invoiceNumber",
         "externalCompanyId","externalSupplierId","currency",
@@ -322,7 +326,6 @@ def get_access_token(base_url: str, client_id: str, client_secret: str, auth_pat
         raise RuntimeError(f"No access_token in response: {payload}")
     return access_token, datetime.utcnow() + timedelta(seconds=int(expires_in)), payload
 
-
 def bearer_headers(token: str):
     return {
         "Authorization": f"Bearer {token}",
@@ -332,7 +335,11 @@ def bearer_headers(token: str):
 # =========================
 # --- CSV -> Hypatos Payload
 # =========================
-def build_invoice_payload_from_rows(rows, overrides):
+def build_invoice_payload_from_rows(rows, overrides, header_tax_mode=False):
+    """
+    header_tax_mode=False (default): tax provided on line level -> sum to header, include on lines.
+    header_tax_mode=True:  tax provided on header level     -> use first row's header tax, exclude line-level tax keys.
+    """
     first = rows[0]
 
     external_id = first.get("externalId") or overrides.get("external_id")
@@ -361,7 +368,7 @@ def build_invoice_payload_from_rows(rows, overrides):
         "totalNetAmount": None,
         "totalFreightCharges": to_num(d(first.get("totalFreightCharges"))),
         "totalOtherCharges": to_num(d(first.get("totalOtherCharges"))),
-        "totalTaxAmount": None,
+        "totalTaxAmount": None,         # set later based on header_tax_mode
         "totalGrossAmount": None,
         "paymentTerms": None,
         "externalApproverId": first.get("externalApproverId"),
@@ -377,6 +384,7 @@ def build_invoice_payload_from_rows(rows, overrides):
     if payload["documentId"]:
         payload["documents"] = [{"id": payload["documentId"], "type": "invoice"}]
 
+    # Payment terms
     pt_key = first.get("paymentTermKey")
     pt_text = first.get("paymentTermText")
     pt_lang = first.get("paymentTermLanguage") or "en"
@@ -386,10 +394,12 @@ def build_invoice_payload_from_rows(rows, overrides):
             "descriptions": [{"text": pt_text or "", "language": pt_lang}],
         }
 
+    # Header custom fields
     for k, v in first.items():
         if k.startswith("customFields."):
             payload["customFields"][k.split("customFields.", 1)[1]] = v
 
+    # Header custom metadata
     cm = first.get("customMetadata")
     if cm:
         try:
@@ -397,6 +407,7 @@ def build_invoice_payload_from_rows(rows, overrides):
         except json.JSONDecodeError:
             pass
 
+    # Withholding tax (optional)
     if first.get("wht.key") or first.get("wht.amount") or first.get("wht.baseAmount"):
         wht = {
             "key": first.get("wht.key"),
@@ -406,8 +417,9 @@ def build_invoice_payload_from_rows(rows, overrides):
         }
         payload["withholdingTax"].append(wht)
 
+    # Totals accumulation
     sum_net = Decimal("0")
-    sum_tax = Decimal("0")
+    sum_tax = Decimal("0")  # only used in line-tax mode
     sum_gross = Decimal("0")
 
     for r in rows:
@@ -417,7 +429,7 @@ def build_invoice_payload_from_rows(rows, overrides):
             "type": r.get("line.type") or r.get("type"),
             "quantity": to_num(d(r.get("quantity"))),
             "netAmount": to_num(d(r.get("netAmount"))),
-            "totalTaxAmount": to_num(d(r.get("totalTaxAmount"))),
+            # totalTaxAmount handled below (conditional on header_tax_mode)
             "grossAmount": to_num(d(r.get("grossAmount"))),
             "unitOfMeasure": r.get("unitOfMeasure"),
             "unitPrice": to_num(d(r.get("unitPrice"))),
@@ -432,15 +444,16 @@ def build_invoice_payload_from_rows(rows, overrides):
             "accountAssignments": [],
         }
 
+        # Tax code on line
         tax_code = r.get("taxCode.code") or r.get("taxCodeCode")
         tax_desc = r.get("taxCode.description") or r.get("taxCodeDescription")
         if tax_code or tax_desc:
             line["taxCode"] = {"code": tax_code, "description": tax_desc}
 
+        # Line custom fields/metadata
         for k, v in r.items():
             if k.startswith("line.customFields."):
                 line["customFields"][k.split("line.customFields.", 1)[1]] = v
-
         lcm = r.get("line.customMetadata")
         if lcm:
             try:
@@ -448,6 +461,7 @@ def build_invoice_payload_from_rows(rows, overrides):
             except json.JSONDecodeError:
                 pass
 
+        # Account assignment on line (optional)
         aa = {
             "externalGlAccountId": r.get("externalGlAccountId"),
             "externalCostCenterId": r.get("externalCostCenterId"),
@@ -461,28 +475,47 @@ def build_invoice_payload_from_rows(rows, overrides):
         if any(v is not None and str(v) != "" for v in aa.values()):
             line["accountAssignments"].append(aa)
 
-        payload["invoiceLines"].append(line)
-
+        # Totals accumulation (net / gross always; tax depends on mode)
         if (nv := d(r.get("netAmount"))) is not None:
             sum_net += nv
-        if (tv := d(r.get("totalTaxAmount"))) is not None:
-            sum_tax += tv
         if (gv := d(r.get("grossAmount"))) is not None:
             sum_gross += gv
 
+        if not header_tax_mode:
+            # Scenario 1: tax on lines -> include on line and sum to header
+            line_tax_val = to_num(d(r.get("totalTaxAmount")))
+            if line_tax_val is not None:
+                line["totalTaxAmount"] = line_tax_val
+            if (tv := d(r.get("totalTaxAmount"))) is not None:
+                sum_tax += tv
+        # else: header_tax_mode=True -> do NOT include line['totalTaxAmount']
+
+        payload["invoiceLines"].append(line)
+
+    # Final totals
     payload["totalNetAmount"] = to_num(sum_net)
-    payload["totalTaxAmount"] = to_num(sum_tax)
+
+    if header_tax_mode:
+        # Scenario 2: header tax from first row only (do NOT sum)
+        header_tax = to_num(d(first.get("totalTaxAmount")))
+        payload["totalTaxAmount"] = header_tax
+    else:
+        payload["totalTaxAmount"] = to_num(sum_tax)
 
     if payload["totalFreightCharges"] is None:
         payload["totalFreightCharges"] = 0.0
     if payload["totalOtherCharges"] is None:
         payload["totalOtherCharges"] = 0.0
+
     if sum_gross:
         payload["totalGrossAmount"] = to_num(sum_gross)
     else:
-        gross = sum_net + sum_tax + Decimal(str(payload["totalFreightCharges"])) + Decimal(str(payload["totalOtherCharges"]))
+        gross = sum_net + (d(payload["totalTaxAmount"]) or Decimal("0")) \
+                + Decimal(str(payload["totalFreightCharges"])) \
+                + Decimal(str(payload["totalOtherCharges"]))
         payload["totalGrossAmount"] = to_num(gross)
 
+    # Prune empties
     def prune(obj):
         if isinstance(obj, dict):
             return {k: prune(v) for k, v in obj.items() if v not in (None, {}, [], "")}
@@ -520,9 +553,7 @@ client_id = st.text_input("Client ID", type="default")
 client_secret = st.text_input("Client Secret", type="password")
 uploaded_csv = st.file_uploader("Upload CSV (invoice lines)", type=["csv"])
 
-
 with st.expander("📥 Sample CSV downloads", expanded=False):
-    # Basic sample (if you already added this earlier)
     basic_bytes = make_sample_csv_bytes(with_gl_cc=False)
     st.download_button(
         label="Download sample (basic, 2 invoices / 3 lines)",
@@ -532,7 +563,6 @@ with st.expander("📥 Sample CSV downloads", expanded=False):
         use_container_width=True,
     )
 
-    # With GL & Cost Center (if added earlier)
     glcc_bytes = make_sample_csv_bytes(with_gl_cc=True)
     st.download_button(
         label="Download sample (with GL & Cost Center)",
@@ -542,7 +572,6 @@ with st.expander("📥 Sample CSV downloads", expanded=False):
         use_container_width=True,
     )
 
-    # NEW: Scenario-rich demo file (FI / PO combinations)
     scenarios_bytes = make_scenarios_csv_bytes()
     st.download_button(
         label="Download sample (scenario-rich: FI & PO cases)",
@@ -551,7 +580,7 @@ with st.expander("📥 Sample CSV downloads", expanded=False):
         mime="text/csv",
         use_container_width=True,
     )
-    
+
 with st.expander("Optional header overrides (used if missing in CSV, or in Test Mode)"):
     override_external_client_id = st.text_input("externalClientId (fallback/test)", value="CLIENT-TEST")
     override_external_company_id = st.text_input("externalCompanyId (fallback/test)", value="COMPANY-TEST")
@@ -561,6 +590,17 @@ with st.expander("Optional header overrides (used if missing in CSV, or in Test 
     override_external_id = st.text_input("externalId (invoice id)", value="TEST-INVOICE-001")
 
 test_mode = st.checkbox("Test without CSV (use only overrides & dummy line)", value=False)
+
+# Tax mode toggle (NEW)
+header_tax_mode = st.toggle(
+    "Provide total tax at header (ignore per-line 'totalTaxAmount')",
+    value=False,
+    help=(
+        "OFF = Read tax on each line and sum to header. "
+        "ON = Read 'totalTaxAmount' once from the first row and do NOT include "
+        "'totalTaxAmount' on invoice lines in the payload."
+    ),
+)
 
 dry_run = st.toggle("Dry run (do not POST, just preview JSON)", value=True)
 pretty = st.toggle("Pretty-print JSON", value=True)
@@ -614,7 +654,7 @@ with col2:
                 "quantity": "1",
                 "unitPrice": "100.00",
                 "netAmount": "100.00",
-                "totalTaxAmount": "19.00",
+                "totalTaxAmount": "19.00",   # used only if header_tax_mode == False
                 "grossAmount": "119.00",
                 "itemText": "Dummy service for testing"
             }
@@ -629,7 +669,6 @@ with col2:
         # Transform and (optionally) POST
         results = []
         for ext_id, rows in groups.items():
-            # Build payload
             overrides = {
                 "external_client_id": override_external_client_id or None,
                 "external_company_id": override_external_company_id or None,
@@ -639,7 +678,7 @@ with col2:
                 "external_id": override_external_id or None,
             }
             try:
-                payload = build_invoice_payload_from_rows(rows, overrides)
+                payload = build_invoice_payload_from_rows(rows, overrides, header_tax_mode=header_tax_mode)
             except Exception as e:
                 results.append((ext_id, None, f"Build payload error: {e}", None))
                 continue
