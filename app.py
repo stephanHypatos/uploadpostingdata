@@ -4,6 +4,7 @@ import time
 from typing import Dict, List, Tuple
 
 import pandas as pd
+import math
 import requests
 import streamlit as st
 
@@ -122,17 +123,71 @@ def get_auth_headers(token: str, extra: Dict[str, str] = None) -> Dict[str, str]
 # ---------- Generic dataframe loading ----------
 def load_table(uploaded_file) -> pd.DataFrame:
     """
-    Accepts .xlsx/.xls or .csv. Normalizes column names to preserve exact keys.
+    Reads CSV/XLSX strictly as strings to preserve leading zeros.
+    - Strips header whitespace
+    - Keeps empty cells as empty strings (not NaN)
+    - Trims string cell whitespace
+    - Safely removes a *leading* apostrophe only when it's the Excel text marker
+      (e.g., "'00001" -> "00001"), without touching normal words like "'note".
     """
-    filename = uploaded_file.name.lower()
-    if filename.endswith(".csv"):
-        df = pd.read_csv(uploaded_file)
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        df = pd.read_csv(
+            uploaded_file,
+            dtype=str,
+            keep_default_na=False,  # don't auto-convert "" to NaN
+            na_filter=False,
+        )
     else:
-        # default to excel
-        df = pd.read_excel(uploaded_file)
-    # strip whitespace from headers
-    df.columns = [c.strip() for c in df.columns]
+        df = pd.read_excel(
+            uploaded_file,
+            dtype=str,              # force strings
+            keep_default_na=False,  # keep "" not NaN
+            engine="openpyxl" if name.endswith("xlsx") else None,
+        )
+
+    # normalize headers
+    df.columns = [str(c).strip() for c in df.columns]
+
+    def _normalize(val: str) -> str:
+        if val is None:
+            return ""
+        if isinstance(val, str):
+            v = val.strip()
+            # If it starts with a single quote and what's after is digits, it's likely Excel's text marker
+            if v.startswith("'") and v[1:].isdigit():
+                return v[1:]
+            return v
+        # Numbers, bools, etc. -> stringify without losing leading zeros (we don't have them once it's numeric)
+        # but dtype=str above should already prevent numeric parsing.
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+                return ""
+            return str(val)
+        return str(val)
+
+    # apply to all cells
+    df = df.applymap(_normalize)
     return df
+
+def row_to_string_payload(row: pd.Series) -> dict:
+    """
+    Build a JSON-ready dict where:
+    - Only non-empty values are included
+    - Every value is a *string*
+    """
+    payload = {}
+    for k, v in row.items():
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s == "" or s.lower() == "nan":
+            continue
+        payload[k] = s
+    return payload
+
+def build_payloads(df: pd.DataFrame) -> list[dict]:
+    return [row_to_string_payload(df.iloc[i]) for i in range(len(df))]
 
 # ---------- Invoices page (existing behavior skeleton) ----------
 def page_invoices(token: str, base_url: str):
@@ -176,8 +231,9 @@ def page_lookup_tables(token: str, base_url: str):
 
     st.markdown(
         """
-        Provide a **lookup table type** (e.g. `payment_terms`), then upload an **Excel/CSV**.
-        Expected columns: `externalId`, `key`, `description` (optional extras allowed; they will be sent as additional JSON fields).
+        1) Enter the **lookup table type** (e.g. `payment_terms`)  
+        2) Upload **Excel/CSV** with columns like `externalId`, `key`, `description`, plus any extra fields.  
+        All values are sent as **strings** (API requires strings).
         """
     )
 
@@ -186,70 +242,86 @@ def page_lookup_tables(token: str, base_url: str):
 
     col_req, col_opt = st.columns(2)
     with col_req:
-        st.caption("**Required-ish** (recommended)")
+        st.caption("**Recommended columns**")
         st.code("externalId\nkey\ndescription", language="text")
     with col_opt:
-        st.caption("**Optional** (any other columns you add will be sent too)")
+        st.caption("**Optional columns**")
+        st.text("Any others you add will be included as string fields.")
 
-    validate_cols = st.checkbox("Validate required columns (`externalId`, `key`, `description`)", value=True)
+    validate_cols = st.checkbox("Validate recommended columns (`externalId`, `key`, `description`)", value=True)
 
     if not lookup_type or not uploaded:
         return
 
     df = load_table(uploaded)
-    st.write("Preview:", df.head())
+    st.write("Preview (as strings, leading zeros preserved):")
+    st.dataframe(df.head(20), use_container_width=True)
 
     # Basic column validation (optional)
     required = {"externalId", "key", "description"}
     if validate_cols:
         missing = [c for c in required if c not in df.columns]
         if missing:
-            st.error(f"Missing required columns: {', '.join(missing)}")
+            st.error(f"Missing columns: {', '.join(missing)}")
             return
 
-    # Endpoint: /v2/enrichment/lookup-tables/{type}
+    # Build payloads (all-string, no empty values)
+    payloads = build_payloads(df)
+
+    # ---- Payload preview ----
+    st.markdown("#### Payload preview")
+    preview_count = min(5, len(payloads))
+    if preview_count == 0:
+        st.warning("No non-empty rows found.")
+        return
+
+    st.caption(f"Showing first {preview_count} of {len(payloads)} payload(s).")
+    st.code(json.dumps(payloads[:preview_count], indent=2, ensure_ascii=False), language="json")
+
+    # Endpoint target
     endpoint = f"{base_url.rstrip('/')}/v2/enrichment/lookup-tables/{lookup_type}"
     st.write("Target endpoint:", endpoint)
 
-    run = st.button("Insert rows")
-    if not run:
-        return
+    # Optionally throttle
+    throttle_ms = st.slider("Throttle between requests (ms)", min_value=0, max_value=2000, value=0, step=50)
 
-    headers = get_auth_headers(token)
-    results: List[Dict] = []
-    ok, ko = 0, 0
+    # ---- Send one request per row ----
+    if st.button(f"Send {len(payloads)} request(s)"):
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        # Allow extra headers from sidebar if you stored them
+        if st.session_state.get("extra_headers"):
+            headers.update(st.session_state["extra_headers"])
 
-    progress = st.progress(0, text="Uploading rows...")
-    n = len(df)
+        results = []
+        ok = ko = 0
+        progress = st.progress(0, text="Uploading rows...")
 
-    for i, row in df.iterrows():
-        # Build payload: include externalId, key, description, and any extra columns.
-        # We keep the original names so they map 1:1 to your API.
-        # Example resulting JSON:
-        # {
-        #   "externalId": "12345",
-        #   "key": "someValue",
-        #   "description": "anotherValue",
-        #   "customField": "dynamicValue"
-        # }
-        payload = {k: v for k, v in row.items() if pd.notna(v)}
-        try:
-            resp = requests.post(endpoint, headers=headers, json=payload, timeout=60)
-            if resp.status_code < 300:
-                ok += 1
-                results.append({"row": i, "status": "OK", "http": resp.status_code})
-            else:
+        for idx, payload in enumerate(payloads, start=1):
+            try:
+                resp = requests.post(endpoint, headers=headers, json=payload, timeout=60)
+                if resp.status_code < 300:
+                    ok += 1
+                    results.append({"row": idx, "status": "OK", "http": resp.status_code})
+                else:
+                    ko += 1
+                    # The API error you saw ("Additional properties must be strings") will be visible here
+                    results.append(
+                        {"row": idx, "status": "ERROR", "http": resp.status_code, "body": resp.text[:2000]}
+                    )
+            except Exception as e:
                 ko += 1
-                # Keep a short slice of response text to avoid huge UI
-                results.append({"row": i, "status": "ERROR", "http": resp.status_code, "body": resp.text[:2000]})
-        except Exception as e:
-            ko += 1
-            results.append({"row": i, "status": "ERROR", "http": "-", "body": str(e)})
+                results.append({"row": idx, "status": "ERROR", "http": "-", "body": str(e)})
 
-        progress.progress(int(((i + 1) / n) * 100), text=f"Uploaded {i+1}/{n}")
+            if throttle_ms:
+                time.sleep(throttle_ms / 1000.0)
 
-    st.success(f"Finished. OK: {ok}, Errors: {ko}")
-    st.dataframe(pd.DataFrame(results))
+            progress.progress(int(idx * 100 / len(payloads)), text=f"Uploaded {idx}/{len(payloads)}")
+
+        st.success(f"Finished. OK: {ok}, Errors: {ko}")
+        st.dataframe(pd.DataFrame(results), use_container_width=True)
 
 # ---------- Main App ----------
 def main():
