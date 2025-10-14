@@ -226,18 +226,48 @@ def page_invoices(token: str, base_url: str):
         st.dataframe(pd.DataFrame(results))
 
 # ---------- Lookup table page (NEW) ----------
+def _slugify_type(name: str) -> str:
+    """
+    Lowercase, trim, replace spaces with underscores, and remove characters
+    that are not letters, digits or underscore.
+    """
+    if not name:
+        return ""
+    s = name.strip().lower().replace(" ", "_")
+    s = re.sub(r"[^a-z0-9_]", "", s)
+    return s
+
 def page_lookup_tables(token: str, base_url: str):
     st.subheader("Insert Lookup Table Rows")
 
     st.markdown(
         """
-        1) Enter the **lookup table type** (e.g. `payment_terms`)  
+        1) Select the **lookup table type**  
         2) Upload **Excel/CSV** with columns like `externalId`, `key`, `description`, plus any extra fields.  
         All values are sent as **strings** (API requires strings).
         """
     )
 
-    lookup_type = st.text_input("Lookup table type (path param `{type}`)", placeholder="payment_terms")
+    # ---- Type select with "custom" ----
+    type_choice = st.selectbox(
+        "Lookup table type (path param `{type}`)",
+        options=["payment_terms", "tax_codes", "central_bank_indicator", "custom"],
+        index=0,
+        help="Choose a predefined type or 'custom' to provide your own.",
+    )
+
+    custom_type = ""
+    if type_choice == "custom":
+        raw_custom = st.text_input(
+            "Custom lookup table type",
+            placeholder="my_table",
+            help="Allowed: letters, numbers, underscore. Spaces will become underscores.",
+        )
+        custom_type = _slugify_type(raw_custom)
+        if raw_custom and not custom_type:
+            st.error("Invalid custom type. Use only letters, numbers, or underscore.")
+    lookup_type = custom_type if type_choice == "custom" else type_choice
+
     uploaded = st.file_uploader("Excel/CSV with rows to insert", type=["xlsx", "xls", "csv"])
 
     col_req, col_opt = st.columns(2)
@@ -250,14 +280,20 @@ def page_lookup_tables(token: str, base_url: str):
 
     validate_cols = st.checkbox("Validate recommended columns (`externalId`, `key`, `description`)", value=True)
 
+    # Guard: need a lookup_type
+    if type_choice == "custom" and not lookup_type:
+        st.info("Enter a valid custom type to continue.")
+        return
+
     if not lookup_type or not uploaded:
         return
 
+    # ---- Load & show table (preserves leading zeros) ----
     df = load_table(uploaded)
     st.write("Preview (as strings, leading zeros preserved):")
     st.dataframe(df.head(20), use_container_width=True)
 
-    # Basic column validation (optional)
+    # ---- Validate columns (optional) ----
     required = {"externalId", "key", "description"}
     if validate_cols:
         missing = [c for c in required if c not in df.columns]
@@ -265,7 +301,7 @@ def page_lookup_tables(token: str, base_url: str):
             st.error(f"Missing columns: {', '.join(missing)}")
             return
 
-    # Build payloads (all-string, no empty values)
+    # ---- Build all-string payloads ----
     payloads = build_payloads(df)
 
     # ---- Payload preview ----
@@ -278,11 +314,10 @@ def page_lookup_tables(token: str, base_url: str):
     st.caption(f"Showing first {preview_count} of {len(payloads)} payload(s).")
     st.code(json.dumps(payloads[:preview_count], indent=2, ensure_ascii=False), language="json")
 
-    # Endpoint target
+    # ---- Endpoint target ----
     endpoint = f"{base_url.rstrip('/')}/v2/enrichment/lookup-tables/{lookup_type}"
     st.write("Target endpoint:", endpoint)
 
-    # Optionally throttle
     throttle_ms = st.slider("Throttle between requests (ms)", min_value=0, max_value=2000, value=0, step=50)
 
     # ---- Send one request per row ----
@@ -291,7 +326,6 @@ def page_lookup_tables(token: str, base_url: str):
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
-        # Allow extra headers from sidebar if you stored them
         if st.session_state.get("extra_headers"):
             headers.update(st.session_state["extra_headers"])
 
@@ -307,10 +341,7 @@ def page_lookup_tables(token: str, base_url: str):
                     results.append({"row": idx, "status": "OK", "http": resp.status_code})
                 else:
                     ko += 1
-                    # The API error you saw ("Additional properties must be strings") will be visible here
-                    results.append(
-                        {"row": idx, "status": "ERROR", "http": resp.status_code, "body": resp.text[:2000]}
-                    )
+                    results.append({"row": idx, "status": "ERROR", "http": resp.status_code, "body": resp.text[:2000]})
             except Exception as e:
                 ko += 1
                 results.append({"row": idx, "status": "ERROR", "http": "-", "body": str(e)})
